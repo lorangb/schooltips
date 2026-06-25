@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,6 +26,33 @@ func fetchURL(target string) (*http.Response, error) {
 
 	client := &http.Client{}
 	return client.Do(req)
+}
+
+// isHTML checks if the response has an HTML content type.
+func isHTML(resp *http.Response) bool {
+	ct := resp.Header.Get("Content-Type")
+	return strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml+xml")
+}
+
+// proxyRaw streams the upstream response body directly to the provided writer
+// with the original Content-Type header. Used for CSS, JS, images, etc.
+func proxyRaw(w http.ResponseWriter, target string) error {
+	resp, err := fetchURL(target)
+	if err != nil {
+		return fmt.Errorf("fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Pass through Content-Type
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+
+	// Copy any other useful headers
+	if resp.Header.Get("Cache-Control") != "" {
+		w.Header().Set("Cache-Control", resp.Header.Get("Cache-Control"))
+	}
+
+	_, err = io.Copy(w, resp.Body)
+	return err
 }
 
 // resolveURL turns a possibly-relative href found in the HTML into an absolute

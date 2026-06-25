@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"golang.org/x/net/html"
 )
 
 // indexHandler renders a simple landing page with a URL bar so users can type
@@ -34,6 +36,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 
 // browseHandler is the core proxy endpoint. It expects ?url=<target> and
 // streams back the rewritten HTML so all subsequent clicks stay proxied.
+// For non-HTML content (CSS, JS, images) it passes through the raw bytes.
 func browseHandler(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("url")
 	if target == "" {
@@ -52,13 +55,46 @@ func browseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := proxyPage(target)
+	// First fetch to check content type
+	resp, err := fetchURL(target)
 	if err != nil {
 		log.Printf("proxy error for %s: %v", target, err)
 		http.Error(w, "failed to fetch page: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+	defer resp.Body.Close()
+
+	// If it's not HTML, pass through raw bytes with original content type
+	if !isHTML(resp) {
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		if resp.Header.Get("Cache-Control") != "" {
+			w.Header().Set("Cache-Control", resp.Header.Get("Cache-Control"))
+		}
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// It's HTML — rewrite links and proxy
+	base, err := url.Parse(target)
+	if err != nil {
+		http.Error(w, "invalid url", http.StatusBadGateway)
+		return
+	}
+
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		log.Printf("html parse error for %s: %v", target, err)
+		http.Error(w, "failed to parse html", http.StatusBadGateway)
+		return
+	}
+
+	rewriteHTML(doc, base)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	io.WriteString(w, body)
+	var b strings.Builder
+	if err := html.Render(&b, doc); err != nil {
+		http.Error(w, "failed to render html", http.StatusBadGateway)
+		return
+	}
+	io.WriteString(w, b.String())
 }
