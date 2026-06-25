@@ -264,17 +264,19 @@ func injectBaseTag(n *html.Node, pageURL string) {
 // proxyInterceptorScript returns a <script> tag that intercepts fetch/XHR/
 // EventSource/history at runtime and routes all URLs through the proxy.
 //
-// The <base> tag handles relative URL resolution transparently (the browser
-// resolves them against /browse?url=CURRENT_PAGE). This interceptor only
-// catches absolute URLs that bypass the base tag — dynamic fetch/XHR to
-// external CDNs, programmatic img.src assignments, etc.
+// Only proxies absolute (http/https) and protocol-relative (//) URLs.
+// Relative URLs are handled automatically by the <base> tag at the browser
+// level — the browser resolves them against the proxy base before sending
+// the request.
 func proxyInterceptorScript() string {
 	return `<script data-st="1">
 (function(){
 var P='/browse?url=';
 function p(u){
 if(!u||u.indexOf('data:')===0||u.indexOf('blob:')===0||u.indexOf('javascript:')===0||u.indexOf('#')===0||u.indexOf(P)===0)return u;
-try{return P+encodeURIComponent(new URL(u,location.href).href)}catch(e){return u}
+if(u.indexOf('//')===0){u='https:'+u};
+if(u.indexOf('http')===0){return P+encodeURIComponent(u)};
+return u;
 }
 var f=window.fetch;window.fetch=function(u,o){return f.call(window,p(u),o)};
 var o=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return o.call(this,m,p(u))};
