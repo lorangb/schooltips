@@ -59,12 +59,17 @@ func proxyRequest(r *http.Request, target string) (*http.Response, error) {
 	}
 
 	// Copy relevant request headers, skipping hop-by-hop headers.
+	// Also skip Accept-Encoding — Go's http.Client auto-negotiates gzip/deflate
+	// but does NOT support brotli. If we forward the client's Accept-Encoding
+	// (which may include 'br'), the upstream may return brotli and we'd serve
+	// compressed garbage as HTML.
 	skipHeaders := map[string]bool{
 		"host":              true,
 		"connection":        true,
 		"proxy-connection":  true,
 		"upgrade":           true,
 		"transfer-encoding": true,
+		"accept-encoding":   true,
 		"sec-fetch-site":    true,
 		"sec-fetch-mode":    true,
 		"sec-fetch-dest":    true,
