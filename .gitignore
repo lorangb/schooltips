@@ -1,0 +1,13 @@
+# Binaries
+backend/schooltips
+
+# Go
+vendor/
+
+# Temp
+tmp/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
