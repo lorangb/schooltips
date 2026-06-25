@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -11,8 +12,7 @@ import (
 	"golang.org/x/net/html"
 )
 
-// indexHandler renders a simple landing page with a URL bar so users can type
-// a destination site and enter the proxy.
+// indexHandler renders the landing page with a URL bar.
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -34,67 +34,122 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 </html>`)
 }
 
-// browseHandler is the core proxy endpoint. It expects ?url=<target> and
-// streams back the rewritten HTML so all subsequent clicks stay proxied.
-// For non-HTML content (CSS, JS, images) it passes through the raw bytes.
+// browseHandler is the core proxy endpoint.
+//
+// It accepts any HTTP method (GET, POST, etc.), forwards the request to target,
+// and:
+//   - Rewrites redirect 3xx Location headers back through the proxy
+//   - Rewrites CSS url() and @import references for proxied CSS files
+//   - Parses and rewrites all HTML links/attributes so navigation stays proxied
+//   - Injects a <base> tag so relative URLs auto-resolve through the proxy
+//   - Injects a JS interceptor that patches fetch/XHR/history at runtime
+//   - Passes non-HTML content (images, JS, fonts) through raw
 func browseHandler(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("url")
 	if target == "" {
 		http.Error(w, "missing 'url' query parameter", http.StatusBadRequest)
 		return
 	}
-
-	// Allow users to type bare domains like "example.com".
 	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
 		target = "https://" + target
 	}
 
-	parsed, err := url.Parse(target)
-	if err != nil || parsed.Host == "" {
+	parsedTarget, err := url.Parse(target)
+	if err != nil || parsedTarget.Host == "" {
 		http.Error(w, "invalid url", http.StatusBadRequest)
 		return
 	}
 
-	// First fetch to check content type
-	resp, err := fetchURL(target)
+	// Forward the request (GET, POST, etc.) to the target.
+	resp, err := proxyRequest(r, target)
 	if err != nil {
 		log.Printf("proxy error for %s: %v", target, err)
-		http.Error(w, "failed to fetch page: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "failed to fetch: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// If it's not HTML, pass through raw bytes with original content type
-	if !isHTML(resp) {
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	// ── Handle redirects ─────────────────────────────────────────────────
+	// Rewrite the Location header so the browser stays inside the proxy.
+	if isRedirect(resp.StatusCode) {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			http.Error(w, "redirect with no location", resp.StatusCode)
+			return
+		}
+		absLoc := resolveURL(parsedTarget, location)
+		http.Redirect(w, r, proxiedURL(absLoc), http.StatusFound)
+		return
+	}
+
+	ct := resp.Header.Get("Content-Type")
+
+	// ── CSS: rewrite url() and @import references ────────────────────────
+	if strings.Contains(ct, "text/css") {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "failed to read css", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		if resp.Header.Get("Cache-Control") != "" {
 			w.Header().Set("Cache-Control", resp.Header.Get("Cache-Control"))
 		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write([]byte(rewriteCSSURLs(string(body), target)))
+		return
+	}
+
+	// ── Non-HTML: raw passthrough ────────────────────────────────────────
+	if !isHTML(resp) {
+		w.Header().Set("Content-Type", ct)
+		if resp.Header.Get("Cache-Control") != "" {
+			w.Header().Set("Cache-Control", resp.Header.Get("Cache-Control"))
+		}
+		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 		return
 	}
 
-	// It's HTML — rewrite links and proxy
-	base, err := url.Parse(target)
+	// ── HTML: parse, rewrite, inject ────────────────────────────────────
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		http.Error(w, "invalid url", http.StatusBadGateway)
+		http.Error(w, "failed to read body", http.StatusBadGateway)
 		return
 	}
 
-	doc, err := html.Parse(resp.Body)
+	if len(body) == 0 {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+
+	doc, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
+		// If parsing fails, serve raw HTML so page isn't blank.
 		log.Printf("html parse error for %s: %v", target, err)
-		http.Error(w, "failed to parse html", http.StatusBadGateway)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
 		return
 	}
 
-	rewriteHTML(doc, base)
+	rewriteHTML(doc, parsedTarget)
+	injectBaseTag(doc, target)
+
+	var buf strings.Builder
+	if err := html.Render(&buf, doc); err != nil {
+		log.Printf("html render error: %v", err)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	result := buf.String()
+
+	// Inject the JS proxy interceptor right before </body>.
+	result = strings.Replace(result, "</body>", proxyInterceptorScript()+"</body>", 1)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	var b strings.Builder
-	if err := html.Render(&b, doc); err != nil {
-		http.Error(w, "failed to render html", http.StatusBadGateway)
-		return
-	}
-	io.WriteString(w, b.String())
+	w.WriteHeader(resp.StatusCode)
+	w.Write([]byte(result))
 }
