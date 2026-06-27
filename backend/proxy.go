@@ -8,9 +8,45 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 )
+
+// cookieJar stores cookies per domain, persisted in memory for the session.
+// This is needed because the browser won't send 3rd-party cookies to the proxy
+// domain — cookies for example.com are never sent to schooltips.io.
+var (
+	cookieJar = make(map[string][]*http.Cookie)
+	cookieMu  sync.RWMutex
+)
+
+// getCookies returns stored cookies for a given host.
+func getCookies(host string) []*http.Cookie {
+	cookieMu.RLock()
+	defer cookieMu.RUnlock()
+	return cookieJar[host]
+}
+
+// setCookies stores cookies received for a given host.
+func setCookies(host string, cookies []*http.Cookie) {
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	existing := cookieJar[host]
+	// Merge: new cookies replace old ones with the same name.
+	updated := make([]*http.Cookie, 0, len(existing)+len(cookies))
+	keep := make(map[string]bool)
+	for _, c := range cookies {
+		keep[c.Name] = true
+		updated = append(updated, c)
+	}
+	for _, c := range existing {
+		if !keep[c.Name] {
+			updated = append(updated, c)
+		}
+	}
+	cookieJar[host] = updated
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -88,8 +124,10 @@ func proxyRequest(r *http.Request, target string) (*http.Response, error) {
 	proxyReq.Header.Set("User-Agent",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "+
 			"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	proxyReq.Header.Set("Accept",
-		"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	// Always accept all content types. The browser sends Accept: text/html
+	// for every /browse?url=... request (even CSS/JS/images), so forwarding
+	// that would make CDNs return HTML for non-HTML resources.
+	proxyReq.Header.Set("Accept", "*/*")
 	proxyReq.Host = targetURL.Host
 
 	client := &http.Client{
@@ -97,7 +135,23 @@ func proxyRequest(r *http.Request, target string) (*http.Response, error) {
 			return http.ErrUseLastResponse // we handle redirects ourselves
 		},
 	}
-	return client.Do(proxyReq)
+
+	// Add stored cookies for this domain.
+	stored := getCookies(targetURL.Host)
+	for _, c := range stored {
+		proxyReq.AddCookie(c)
+	}
+
+	resp, err := client.Do(proxyReq)
+
+	// Store any Set-Cookie headers from the response.
+	if err == nil {
+		if cookies := resp.Cookies(); len(cookies) > 0 {
+			setCookies(targetURL.Host, cookies)
+		}
+	}
+
+	return resp, err
 }
 
 // ── attribute rewriting ────────────────────────────────────────────────────
@@ -215,6 +269,7 @@ func rewriteSrcset(val string, base *url.URL) string {
 
 // injectBaseTag adds or updates a <base> tag in <head> with href pointing to
 // the proxy, and target="_self" so all relative URLs auto-resolve through us.
+// Preserves existing <base> attributes (target, etc.).
 func injectBaseTag(n *html.Node, pageURL string) {
 	proxyBase := "/browse?url=" + url.QueryEscape(pageURL)
 
@@ -235,18 +290,25 @@ func injectBaseTag(n *html.Node, pageURL string) {
 		return
 	}
 
-	// Look for existing <base> and update its href.
+	// Look for existing <base> and update its href, preserving all other attrs.
 	for c := head.FirstChild; c != nil; c = c.NextSibling {
 		if c.Type == html.ElementNode && c.Data == "base" {
 			hasHref := false
+			hasTarget := false
 			for i, a := range c.Attr {
 				if a.Key == "href" {
 					c.Attr[i].Val = proxyBase
 					hasHref = true
 				}
+				if a.Key == "target" {
+					hasTarget = true
+				}
 			}
 			if !hasHref {
 				c.Attr = append(c.Attr, html.Attribute{Key: "href", Val: proxyBase})
+			}
+			if !hasTarget {
+				c.Attr = append(c.Attr, html.Attribute{Key: "target", Val: "_self"})
 			}
 			return
 		}
@@ -283,11 +345,18 @@ if(u.indexOf('//')===0){u='https:'+u};
 if(u.indexOf('http')===0){return P+encodeURIComponent(u)};
 return u;
 }
+// Fix window.location for SPAs: replace the browser's /browse?url=... path
+// so client-side routers see the real domain/path.
+try{
+var q=new URLSearchParams(location.search),realUrl=q.get('url');
+if(realUrl){var ru=new URL(decodeURIComponent(realUrl));history.replaceState({},'',ru.pathname+ru.search+ru.hash)}
+}catch(e){}
 var f=window.fetch;window.fetch=function(u,o){return f.call(window,p(u),o)};
 var o=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return o.call(this,m,p(u))};
 var E=window.EventSource;if(E){var W=window.EventSource;window.EventSource=function(u,c){return new W(p(u),c)};window.EventSource.prototype=W.prototype}
 var h=history.pushState;history.pushState=function(s,t,u){return h.call(this,s,t,u?p(u):u)};
 var r=history.replaceState;history.replaceState=function(s,t,u){return r.call(this,s,t,u?p(u):u)};
+try{var ld=Object.getOwnPropertyDescriptor(window.Location.prototype,'href');Object.defineProperty(window,'location',{get:function(){return window.location},set:function(u){window.location.href=p(u)}})}catch(e){}
 })();
 </script>`
 }
